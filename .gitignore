@@ -1,0 +1,32 @@
+# --- Secrets ---
+# This is the most important line.
+# It prevents your .env file with all your passwords
+# from EVER being uploaded to GitHub or shared.
+.env
+.env.*
+
+# --- Docker ---
+# Ignore the local Docker database volume
+postgres_data/
+
+# --- Django / Python ---
+# Bytecode and cache
+__pycache__/
+*.pyc
+
+# Local database file (good practice to include,
+# even though you use Postgres)
+db.sqlite3
+db.sqlite3-journal
+
+# Environment
+venv/
+env/
+.venv/
+
+# --- OS-specific ---
+# Mac
+.DS_Store
+
+# Windows
+Thumbs.db

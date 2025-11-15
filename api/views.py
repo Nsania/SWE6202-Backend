@@ -1,0 +1,486 @@
+from django.shortcuts import render
+from rest_framework import generics, status
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import AllowAny, IsAuthenticated, IsAdminUser
+from rest_framework.exceptions import PermissionDenied
+from .models import Parent, Student, AttendanceLog, StudentBusPass
+from .serializers import (
+    ParentRegistrationSerializer,
+    ParentProfileSerializer,
+    StudentProfileSerializer,
+    StudentScheduleSerializer,
+    StudentBusPassSerializer,
+    AttendanceLogSerializer,
+    CustomTokenObtainPairSerializer,
+    CustomTokenRefreshSerializer
+)
+from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from datetime import timedelta 
+from django.conf import settings
+import pandas as pd
+import os
+from django.contrib.auth.models import User
+from django.db import transaction, IntegrityError
+from django.utils import timezone
+from datetime import datetime, time
+from .permissions import APIKeyCheck
+from .schedule_utils import get_student_schedule_by_id, get_all_schedules
+from django_filters.rest_framework import DjangoFilterBackend
+
+
+
+def set_auth_cookies(response, access_token, refresh_token=None):
+    
+    access_lifetime = settings.SIMPLE_JWT['ACCESS_TOKEN_LIFETIME']
+    
+    response.set_cookie(
+        key='access_token',
+        value=access_token,
+        httponly=True,
+        secure=settings.CSRF_COOKIE_SECURE, 
+        samesite=settings.CSRF_COOKIE_SAMESITE,
+        max_age=access_lifetime.total_seconds(),
+        path='/'
+    )
+    
+    if refresh_token:
+        refresh_lifetime = settings.SIMPLE_JWT['REFRESH_TOKEN_LIFETIME']
+        response.set_cookie(
+            key='refresh_token',
+            value=refresh_token,
+            httponly=True,
+            secure=settings.CSRF_COOKIE_SECURE,
+            samesite=settings.CSRF_COOKIE_SAMESITE,
+            max_age=refresh_lifetime.total_seconds(),
+            path='/' 
+        )
+    return response
+
+
+class CustomTokenObtainPairView(TokenObtainPairView):
+   
+    serializer_class = CustomTokenObtainPairSerializer
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        response_data = serializer.validated_data
+        
+        access_token = serializer.context['access_token']
+        refresh_token = serializer.context['refresh_token']
+        
+        response = Response(response_data, status=status.HTTP_200_OK)
+        
+        set_auth_cookies(response, access_token, refresh_token)
+        
+        return response
+
+class CustomTokenRefreshView(TokenRefreshView):
+    
+    serializer_class = CustomTokenRefreshSerializer
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+
+        access_token = serializer.context['access_token']
+        
+        response = Response({"message": "Token refreshed successfully"}, status=status.HTTP_200_OK)
+        
+        set_auth_cookies(
+            response, 
+            access_token, 
+            serializer.context.get('refresh_token') 
+        )
+        
+        return response
+
+
+class ParentRegistrationView(APIView):
+    permission_classes = [AllowAny] 
+
+    def post(self, request, *args, **kwargs):
+        serializer = ParentRegistrationSerializer(data=request.data)
+        
+        if serializer.is_valid():
+            parent_profile = serializer.save()
+            user = parent_profile.user
+            
+            refresh = RefreshToken.for_user(user)
+            access_token = str(refresh.access_token)
+            refresh_token = str(refresh)
+            
+            user_data = {
+                "user_id": user.id,
+                "email": user.email,
+                "first_name": user.first_name,
+                "last_name": user.last_name
+            }
+            
+            response_data = {
+                "message": "Parent account created successfully.",
+                "user": user_data
+            }
+
+            response = Response(response_data, status=status.HTTP_201_CREATED)
+            
+            set_auth_cookies(response, access_token, refresh_token)
+            return response
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class ParentProfileView(APIView):
+    serializer_class = ParentProfileSerializer
+    permission_classes = [IsAuthenticated] 
+
+    def get(self, request, *args, **kwargs):
+        try:
+            profile = self.request.user.parent_profile
+            serializer = self.serializer_class(profile)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except Parent.DoesNotExist:
+            return Response({"error": "Profile does not exist"}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({"error": f"An error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class ParentChildrenListView(APIView):
+    serializer_class = StudentProfileSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        try:
+            profile = self.request.user.parent_profile
+            children_queryset = profile.children.all()
+            serializer = self.serializer_class(children_queryset, many=True)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except Parent.DoesNotExist:
+            return Response({"error": "Parent profile not found for this user."}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({"error": f"An error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class LinkChildView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        try:
+            parent_profile = request.user.parent_profile
+        except Parent.DoesNotExist:
+            return Response({"error": "Parent profile not found for this user."}, status=status.HTTP_404_NOT_FOUND)
+
+        university_id = request.data.get('child_university_id')
+        reg_code = request.data.get('child_registration_code')
+
+        if not university_id or not reg_code:
+            return Response({"error": "child_university_id and child_registration_code are required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            student = Student.objects.get(university_id=university_id)
+        except Student.DoesNotExist:
+            return Response({"error": "No student found with this University ID."}, status=status.HTTP_404_NOT_FOUND)
+
+        if student.registration_code != reg_code:
+            return Response({"error": "The Registration Code is incorrect for this student."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if parent_profile.children.filter(university_id=university_id).exists():
+            return Response({"error": "This student is already linked to your account."}, status=status.HTTP_400_BAD_REQUEST)
+
+        parent_profile.children.add(student)
+        serializer = StudentProfileSerializer(student)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+class ParentChildLogView(APIView):
+    serializer_class = AttendanceLogSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request, *args, **kwargs):
+        child_university_id = self.kwargs.get('university_id')
+
+        try:
+            parent_profile = self.request.user.parent_profile
+            student = Student.objects.get(university_id=child_university_id)
+
+            if not parent_profile.children.filter(pk=student.pk).exists():
+                raise PermissionDenied("You do not have permission to view this student's logs.")
+
+            queryset = AttendanceLog.objects.filter(student=student).order_by('-timestamp')
+            
+            if not queryset.exists():
+                return Response({"message": "No scans found for this student."}, status=status.HTTP_200_OK)
+
+            serializer = self.serializer_class(queryset, many=True)
+      
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        except Parent.DoesNotExist:
+            return Response({"error": "Parent profile not found."}, status=status.HTTP_404_NOT_FOUND)
+        except Student.DoesNotExist:
+            return Response({"error": "Student not found."}, status=status.HTTP_404_NOT_FOUND)
+        except PermissionDenied as e:
+            return Response({"error": str(e)}, status=status.HTTP_403_FORBIDDEN)
+        except Exception as e:
+            return Response({"error": f"An error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class StudentProfileView(APIView):
+    serializer_class = StudentProfileSerializer
+    permission_classes = [IsAuthenticated] 
+
+    def get(self, request, *args, **kwargs):
+        try:
+            profile = self.request.user.student_profile
+            serializer = self.serializer_class(profile)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except Student.DoesNotExist:
+            return Response({"error": "Profile does not exist"}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({"error": f"An error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class StudentScheduleView(APIView):
+    serializer_class = StudentScheduleSerializer
+    permission_classes = [IsAuthenticated] 
+
+    def get(self, request, *args, **kwargs):
+        try:
+            student_profile = self.request.user.student_profile
+            serializer = self.serializer_class(student_profile)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except Student.DoesNotExist:
+            return Response(
+                {"error": "Student profile not found for this user."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            return Response({"error": f"Could not generate schedule: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class DemoStudentLoginView(APIView):
+    permission_classes = [AllowAny]
+
+    @transaction.atomic
+    def post(self, request, *args, **kwargs):
+        email = request.data.get('email')
+        if not email:
+             return Response({"error": "Email is required."}, status=status.HTTP_400_BAD_REQUEST)
+        email = email.lower()
+        
+        csv_file_path = os.path.join(settings.BASE_DIR, 'students.csv')
+        
+        try:
+            df = pd.read_csv(csv_file_path, dtype=str)
+            student_data = df[df['university_email'].str.lower() == email]
+            
+            if student_data.empty:
+                return Response({"error": "Email not found in student directory (students.csv)."}, status=status.HTTP_404_NOT_FOUND)
+            
+            student_row = student_data.iloc[0].to_dict()
+            
+            student_profile, created_student = Student.objects.get_or_create(
+                university_id=str(student_row['university_id']),
+                defaults={
+                    'university_email': student_row['university_email'],
+                    'personal_email': student_row.get('personal_email', ''),
+                    'schedule_id': student_row.get('schedule_id')
+                }
+            )
+            
+            user, created_user = User.objects.get_or_create(
+                username=email, 
+                defaults={
+                    'email': email,
+                    'first_name': student_row.get('first_name'),
+                    'last_name': student_row.get('last_name')
+                }
+            )
+
+            if not student_profile.user:
+                student_profile.user = user
+                student_profile.save() 
+            
+            student_profile.schedule_id = student_row.get('schedule_id')
+            student_profile.save() 
+
+            refresh = RefreshToken.for_user(user)
+            access_token = str(refresh.access_token)
+            refresh_token = str(refresh)
+            
+            response_data = {
+                "message": "Student login successful.",
+                "user": {
+                    "id": user.id,
+                    "username": user.username,
+                    "first_name": user.first_name,
+                    "last_name": user.last_name
+                }
+            }
+            
+            response = Response(response_data, status=status.HTTP_200_OK)
+            
+            set_auth_cookies(response, access_token, refresh_token)
+            return response
+
+        except FileNotFoundError:
+            return Response({"error": "Server configuration error: students.csv not found."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except IntegrityError:
+            return Response({"error": "Database conflict. Please try again."}, status=status.HTTP_409_CONFLICT)
+        except Exception as e:
+            return Response({"error": f"An unexpected error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class ScanLogView(APIView):
+    permission_classes = [APIKeyCheck]
+
+    @transaction.atomic
+    def post(self, request, *args, **kwargs):
+        student_rfid = request.data.get('student_rfid')
+        bus_number = request.data.get('bus_number')
+        scan_timestamp_str = request.data.get('scan_timestamp')
+
+        if not all([student_rfid, scan_timestamp_str]):
+            return Response({"error": "student_rfid and scan_timestamp are required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            scan_timestamp = datetime.fromisoformat(scan_timestamp_str.replace('Z', '+00:00'))
+        except ValueError:
+            return Response({"error": "Invalid timestamp format. Must be ISO 8601."}, status=status.HTTP_400_BAD_REQUEST)
+
+        server_now = timezone.now()
+        time_difference = abs(server_now - scan_timestamp)
+
+        if time_difference > timedelta(minutes=5):
+            return Response({"error": "Invalid timestamp (Clock Skew > 5 mins)."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            student = Student.objects.get(university_id=student_rfid)
+        except Student.DoesNotExist:
+            return Response({"error": "Student ID not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        active_pass = StudentBusPass.objects.filter(
+            student=student,
+            valid_from__lte=scan_timestamp,
+            valid_until__gte=scan_timestamp,
+            used_at__isnull=True
+        ).first()
+
+        if active_pass:
+            active_pass.used_at = scan_timestamp
+            active_pass.save()
+            AttendanceLog.objects.create(
+                student=student,
+                timestamp=scan_timestamp,
+                bus_number=bus_number,
+                status=AttendanceLog.ScanStatus.OVERRIDE
+            )
+            return Response({"status": "VALID", "reason": "Admin Pass Used"}, status=status.HTTP_200_OK)
+
+        try:
+            schedule_data = get_student_schedule_by_id(student.schedule_id)
+            valid_days_list = schedule_data.get('days_list', [])
+        except Exception as e:
+            print(f"Error building schedule for {student_rfid}: {e}")
+            return Response({"error": f"Could not validate schedule: {e}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        scan_day_short = scan_timestamp.strftime("%a")[:2]
+        
+        is_valid_schedule = (scan_day_short in valid_days_list)
+
+        if is_valid_schedule:
+            AttendanceLog.objects.create(
+                student=student,
+                timestamp=scan_timestamp,
+                bus_number=bus_number,
+                status=AttendanceLog.ScanStatus.VALID
+            )
+            return Response({"status": "VALID", "reason": "Schedule Matched"}, status=status.HTTP_200_OK)
+        else:
+            AttendanceLog.objects.create(
+                student=student,
+                timestamp=scan_timestamp,
+                bus_number=bus_number,
+                status=AttendanceLog.ScanStatus.INVALID
+            )
+            return Response({"status": "INVALID", "reason": "Not on Schedule"}, status=status.HTTP_403_FORBIDDEN)
+
+class CreateBusPassView(generics.CreateAPIView):
+    queryset = StudentBusPass.objects.all()
+    serializer_class = StudentBusPassSerializer
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+    def perform_create(self, serializer):
+        serializer.save(admin_who_granted=self.request.user)
+
+class AdminScanLogView(generics.ListAPIView):
+    serializer_class = AttendanceLogSerializer
+    permission_classes = [IsAuthenticated, IsAdminUser]
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = {
+        'student__university_id': ['exact'],
+        'status': ['exact'],
+        'bus_number': ['exact'],
+        'timestamp': ['date']
+    }
+
+    def get_queryset(self):
+        params = self.request.query_params
+       
+        if params:
+            return AttendanceLog.objects.all().order_by('-timestamp')
+        
+        today = timezone.now().date()
+        return AttendanceLog.objects.filter(timestamp__date=today).order_by('-timestamp')
+
+class StudentScheduleReportView(APIView):
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+    def get(self, request, *args, **kwargs):
+        report_time = timezone.now()
+        
+        day_query = request.query_params.get('day')
+        
+        if not day_query:
+            day_name = report_time.strftime("%A")
+        else:
+            day_name = day_query
+        
+        day_query_short = day_name[:2].title()
+        
+        try:
+            all_schedules = get_all_schedules()
+            all_students = Student.objects.select_related('user').all()
+            report = []
+
+            for student in all_students:
+                is_valid_today = False
+                
+            
+                has_active_pass = StudentBusPass.objects.filter(
+                    student=student,
+                    valid_from__lte=report_time,
+                    valid_until__gte=report_time,
+                    used_at__isnull=True
+                ).exists()
+
+                if has_active_pass:
+                    is_valid_today = True
+                else:
+                    if student.schedule_id:
+                        student_schedule_info = all_schedules.get(str(student.schedule_id))
+                        
+                        if student_schedule_info:
+                            valid_days = student_schedule_info.get('days_list', [])
+                            if day_query_short in valid_days:
+                                is_valid_today = True
+                
+                if is_valid_today:
+                    student_data = {
+                        "university_id": student.university_id,
+                        "full_name": student.user.get_full_name() if student.user else "N/A",
+                        "schedule_id": student.schedule_id
+                    }
+                    report.append(student_data)
+
+            return Response(report, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response({"error": f"Could not generate report: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

@@ -1,0 +1,11 @@
+schedule_id,course,year,days
+1,Software Engineering,1,Mo|We
+2,Software Engineering,2,Tu|Th
+3,Software Engineering,3,Fr
+4,Chemical Engineering,1,Mo|Tu|We
+5,Chemical Engineering,2,Th|Fr
+6,Electrical Engineering,1,Mo|Fr
+7,Electrical Engineering,2,Tu|We
+8,Mechanical Engineering,1,Mo|We|Fr
+9,Mechanical Engineering,2,Tu|Th
+10,Civil Engineering,1,Fr

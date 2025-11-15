@@ -1,0 +1,19 @@
+Git files
+
+.git
+.gitignore
+
+Python cache
+
+pycache/
+*.pyc
+
+OS files
+
+.DS_Store
+
+Virtual environment
+
+.venv/
+venv/
+env/
