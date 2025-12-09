@@ -1,10 +1,13 @@
 from django.shortcuts import render
 from rest_framework import generics, status
 from rest_framework.views import APIView
+from rest_framework.generics import ListAPIView
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated, IsAdminUser
 from rest_framework.exceptions import PermissionDenied
-from .models import Parent, Student, AttendanceLog, StudentBusPass
+from rest_framework.pagination import PageNumberPagination
+from rest_framework import filters
+from .models import Parent, Student, AttendanceLog, StudentBusPass, BusPassRequest
 from .serializers import (
     ParentRegistrationSerializer,
     ParentProfileSerializer,
@@ -13,7 +16,11 @@ from .serializers import (
     StudentBusPassSerializer,
     AttendanceLogSerializer,
     CustomTokenObtainPairSerializer,
-    CustomTokenRefreshSerializer
+    CustomTokenRefreshSerializer,
+    ParentBasicProfileSerializer,
+    BusPassRequestSerializer,
+    AdminStudentDetailSerializer,
+    AdminParentDetailSerializer
 )
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
@@ -28,7 +35,6 @@ from datetime import datetime, time
 from .permissions import APIKeyCheck
 from .schedule_utils import get_student_schedule_by_id, get_all_schedules
 from django_filters.rest_framework import DjangoFilterBackend
-
 
 
 def set_auth_cookies(response, access_token, refresh_token=None):
@@ -58,6 +64,10 @@ def set_auth_cookies(response, access_token, refresh_token=None):
         )
     return response
 
+class Paginator(PageNumberPagination):
+    page_size = 10
+    page_size_query_params = 'page_size'
+    max_page_size = 100
 
 class CustomTokenObtainPairView(TokenObtainPairView):
    
@@ -95,6 +105,28 @@ class CustomTokenRefreshView(TokenRefreshView):
             access_token, 
             serializer.context.get('refresh_token') 
         )
+        
+        return response
+    
+
+class LogoutView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        try:
+
+            refresh_token = request.COOKIES.get('refresh_token')
+            
+            if refresh_token:
+                token = RefreshToken(refresh_token)
+                token.blacklist()
+        except Exception as e:
+            pass
+
+        response = Response({"message": "Logged out successfully"}, status=status.HTTP_200_OK)
+    
+        response.delete_cookie('access_token')
+        response.delete_cookie('refresh_token')
         
         return response
 
@@ -147,7 +179,7 @@ class ParentProfileView(APIView):
             return Response({"error": f"An error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class ParentChildrenListView(APIView):
-    serializer_class = StudentProfileSerializer
+    serializer_class = StudentScheduleSerializer
     permission_classes = [IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
@@ -195,6 +227,19 @@ class ParentChildLogView(APIView):
     serializer_class = AttendanceLogSerializer
     permission_classes = [IsAuthenticated]
     
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = {
+        'status': ['exact'],
+        'bus_number': ['exact'],
+        'timestamp': ['date'],
+        'direction': ['exact']
+    }
+
+    def filter_queryset(self, queryset):
+        for backend in list(self.filter_backends):
+            queryset = backend().filter_queryset(self.request, queryset, self)
+        return queryset
+
     def get(self, request, *args, **kwargs):
         child_university_id = self.kwargs.get('university_id')
 
@@ -207,11 +252,12 @@ class ParentChildLogView(APIView):
 
             queryset = AttendanceLog.objects.filter(student=student).order_by('-timestamp')
             
-            if not queryset.exists():
-                return Response({"message": "No scans found for this student."}, status=status.HTTP_200_OK)
+            filtered_queryset = self.filter_queryset(queryset)
+            
+            if not filtered_queryset.exists():
+                return Response({"message": "No scan logs found matching your criteria."}, status=status.HTTP_200_OK)
 
-            serializer = self.serializer_class(queryset, many=True)
-      
+            serializer = self.serializer_class(filtered_queryset, many=True)
             return Response(serializer.data, status=status.HTTP_200_OK)
 
         except Parent.DoesNotExist:
@@ -336,6 +382,7 @@ class ScanLogView(APIView):
         student_rfid = request.data.get('student_rfid')
         bus_number = request.data.get('bus_number')
         scan_timestamp_str = request.data.get('scan_timestamp')
+        direction_input = request.data.get('direction', 'INBOUND').upper()
 
         if not all([student_rfid, scan_timestamp_str]):
             return Response({"error": "student_rfid and scan_timestamp are required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -351,6 +398,16 @@ class ScanLogView(APIView):
         if time_difference > timedelta(minutes=5):
             return Response({"error": "Invalid timestamp (Clock Skew > 5 mins)."}, status=status.HTTP_400_BAD_REQUEST)
         
+        direction_input = request.data.get('direction')
+        if not direction_input:
+            hour = scan_timestamp.hour
+            if hour < 12:
+                direction_input = 'INBOUND'
+            else:
+                direction_input = 'OUTBOUND'
+        
+        direction_input = direction_input.upper()
+
         try:
             student = Student.objects.get(university_id=student_rfid)
         except Student.DoesNotExist:
@@ -370,7 +427,8 @@ class ScanLogView(APIView):
                 student=student,
                 timestamp=scan_timestamp,
                 bus_number=bus_number,
-                status=AttendanceLog.ScanStatus.OVERRIDE
+                status=AttendanceLog.ScanStatus.OVERRIDE,
+                direction=direction_input
             )
             return Response({"status": "VALID", "reason": "Admin Pass Used"}, status=status.HTTP_200_OK)
 
@@ -390,6 +448,7 @@ class ScanLogView(APIView):
                 student=student,
                 timestamp=scan_timestamp,
                 bus_number=bus_number,
+                direction=direction_input,
                 status=AttendanceLog.ScanStatus.VALID
             )
             return Response({"status": "VALID", "reason": "Schedule Matched"}, status=status.HTTP_200_OK)
@@ -398,7 +457,9 @@ class ScanLogView(APIView):
                 student=student,
                 timestamp=scan_timestamp,
                 bus_number=bus_number,
-                status=AttendanceLog.ScanStatus.INVALID
+                direction=direction_input,
+                status=AttendanceLog.ScanStatus.INVALID,
+                
             )
             return Response({"status": "INVALID", "reason": "Not on Schedule"}, status=status.HTTP_403_FORBIDDEN)
 
@@ -484,3 +545,215 @@ class StudentScheduleReportView(APIView):
 
         except Exception as e:
             return Response({"error": f"Could not generate report: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+
+class StudentAttendanceLogHistoryView(ListAPIView):
+    serializer_class = AttendanceLogSerializer
+    permission_classes = [IsAuthenticated]
+
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['status', 'bus_number', 'direction']
+
+    def get_queryset(self):
+        try:
+            student = self.request.user.student_profile
+        except Student.DoesNotExist:
+            return AttendanceLog.objects_none()
+
+        queryset = AttendanceLog.objects.filter(student=student)
+        from_date = self.request.query_params.get('from_date')
+        to_date = self.request.query_params.get('to_date')
+
+        if from_date:
+            queryset = queryset.filter(timestamp__date__gte=from_date)
+            if to_date:
+                queryset = queryset.filter(timestamp__date__lte=to_date)
+        else:
+            thirty_days_ago = timezone.now() - timedelta(days=30)
+            queryset = queryset.filter(timestamp__gte=thirty_days_ago)
+
+        return queryset.order_by('-timestamp')
+    
+
+class StudentParentListView(generics.ListAPIView):
+    serializer_class =  ParentBasicProfileSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        try:
+            student = self.request.user.student_profile
+            return student.parents.all()
+        except Student.DoesNotExist:
+            return Parent.objects.none()
+
+
+class StudentPassRequestView(generics.ListCreateAPIView):
+    
+    serializer_class = BusPassRequestSerializer
+    permission_classes = [IsAuthenticated]
+
+    pagination_class = Paginator
+
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = {
+        'status': ['exact'],
+        'request_date': ['date', 'gte', 'lte']
+    }
+
+
+    def get_queryset(self):
+        try:
+            student = self.request.user.student_profile
+        except Student.DoesNotExist:
+            return BusPassRequest.objects.none()
+        
+        queryset = BusPassRequest.objects.filter(student=student).order_by('-request_date')
+
+        params = self.request.query_params
+
+        has_filters = 'status' in params or 'request_date' in params
+
+        if not has_filters:
+            thirty_days_ago = timezone.now() - timedelta(days=30)
+            queryset = queryset.filter(request_date__gte=thirty_days_ago)
+
+        return queryset
+
+    def perform_create(self, serializer):
+        try:
+            serializer.save(student=self.request.user.student_profile)
+        except Student.DoesNotExist:
+             pass 
+
+class AdminPassRequestListView(generics.ListAPIView):
+
+    serializer_class = BusPassRequestSerializer
+    permission_classes = [IsAuthenticated, IsAdminUser]
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['status', 'student__university_id']
+
+    def get_queryset(self):
+        queryset = BusPassRequest.objects.all()
+        status_param = self.request.query_params.get('status')
+        if not status_param:
+            queryset = queryset.filter(status=BusPassRequest.RequestStatus.PENDING)
+        return queryset
+
+class AdminApprovePassView(APIView):
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+    @transaction.atomic
+    def post(self, request, pk, *args, **kwargs):
+        try:
+            pass_request = BusPassRequest.objects.get(pk=pk)
+        except BusPassRequest.DoesNotExist:
+            return Response({"error": "Request not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if pass_request.status != BusPassRequest.RequestStatus.PENDING:
+             return Response({"error": "This request has already been processed."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        final_valid_from = request.data.get('valid_from', pass_request.requested_valid_from)
+        
+        final_valid_until = request.data.get('valid_until', pass_request.requested_valid_until)
+
+        StudentBusPass.objects.create(
+            student=pass_request.student,
+            admin_who_granted=request.user,
+            reason=f"Approved Request: {pass_request.reason}",
+            valid_from=final_valid_from,
+            valid_until=final_valid_until
+        )
+
+        pass_request.status = BusPassRequest.RequestStatus.APPROVED
+        pass_request.admin_notes = request.data.get('admin_notes', 'Approved by admin.')
+        pass_request.approved_valid_from = final_valid_from
+        pass_request.approved_valid_until = final_valid_until
+        pass_request.save()
+
+        return Response({
+            "message": "Pass approved and created.",
+            "valid_from": final_valid_from,
+            "valid_until": final_valid_until
+        }, status=status.HTTP_200_OK)
+
+class AdminRejectPassView(APIView):
+
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+    def post(self, request, pk, *args, **kwargs):
+        try:
+            pass_request = BusPassRequest.objects.get(pk=pk)
+        except BusPassRequest.DoesNotExist:
+            return Response({"error": "Request not found"}, status=status.HTTP_404_NOT_FOUND)
+            
+        if pass_request.status != BusPassRequest.RequestStatus.PENDING:
+             return Response({"error": "This request has already been processed."}, status=status.HTTP_400_BAD_REQUEST)
+
+        pass_request.status = BusPassRequest.RequestStatus.REJECTED
+        pass_request.admin_notes = request.data.get('admin_notes', 'Rejected by admin.')
+        pass_request.save()
+
+        return Response({"message": "Request rejected."}, status=status.HTTP_200_OK)
+    
+
+
+class AdminGetStudentInfo(APIView):
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+    def get(self, request, university_id, *args, **kwargs):
+        try:
+            student = Student.objects.get(university_id=university_id)
+            
+            serializer = AdminStudentDetailSerializer(student)
+            
+            return Response(serializer.data, status=status.HTTP_200_OK)
+            
+        except Student.DoesNotExist:
+            return Response(
+                {"error": f"Student with ID {university_id} not found."}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            return Response(
+                {"error": f"An error occurred: {str(e)}"}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+class AdminGetParentInfo(APIView):
+
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+    def get(self, request, pk, *args, **kwargs):
+        try:
+            parent = Parent.objects.get(pk=pk)
+           
+            serializer = AdminParentDetailSerializer(parent)
+            
+            return Response(serializer.data, status=status.HTTP_200_OK)
+            
+        except Parent.DoesNotExist:
+            return Response(
+                {"error": f"Parent with ID {pk} not found."}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            return Response(
+                {"error": f"An error occurred: {str(e)}"}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+class AdminStudentListView(generics.ListAPIView):
+    queryset = Student.objects.all().order_by('university_id')
+    serializer_class = AdminStudentDetailSerializer 
+    permission_classes = [IsAuthenticated, IsAdminUser]
+    
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['university_id', 'university_email', 'user__first_name', 'user__last_name']
+
+class AdminParentListView(generics.ListAPIView):
+    queryset = Parent.objects.all().order_by('id')
+    serializer_class = AdminParentDetailSerializer 
+    permission_classes = [IsAuthenticated, IsAdminUser]
+    
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['user__email', 'user__first_name', 'user__last_name', 'phone_number']

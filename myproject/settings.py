@@ -42,6 +42,7 @@ INSTALLED_APPS = [
     'corsheaders',              # For React frontend
     'rest_framework',
     'rest_framework_simplejwt',
+    'rest_framework_simplejwt.token_blacklist',
     'django_filters',           # For admin filtering
 
     # --- Your Local Apps ---
@@ -193,6 +194,8 @@ SIMPLE_JWT = {
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://127.0.0.1:5500",
+    "http://192.168.8.85:8081",
 ]
 # This is CRITICAL. It allows the browser to send
 # your HttpOnly cookies to the backend.

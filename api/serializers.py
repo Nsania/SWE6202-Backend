@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
-from .models import Parent, Student, AttendanceLog, StudentBusPass
+from .models import Parent, Student, AttendanceLog, StudentBusPass, BusPassRequest
 from django.db import transaction
 from .schedule_utils import get_student_schedule_by_id
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer, TokenRefreshSerializer
@@ -8,21 +8,33 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     def validate(self, attrs):
+
         data = super().validate(attrs)
-        
         refresh = self.get_token(self.user)
+        
         self.context['refresh_token'] = str(refresh)
         self.context['access_token'] = str(refresh.access_token)
 
         del data['refresh']
         del data['access']
+
+        role = 'unknown'
+        
+        if self.user.is_staff:
+            role = 'admin'
+
+        elif hasattr(self.user, 'parent_profile'):
+            role = 'parent'
+
+        elif hasattr(self.user, 'student_profile'):
+            role = 'student'
         
         data['user'] = {
             'id': self.user.id,
             'username': self.user.username,
             'first_name': self.user.first_name,
             'last_name': self.user.last_name,
-            'is_staff': self.user.is_staff
+            'role': role
         }
         
         return data
@@ -190,4 +202,119 @@ class AttendanceLogSerializer(serializers.ModelSerializer):
             'timestamp',
             'bus_number',
             'status',
+            'direction',
         ]
+
+
+class ParentBasicProfileSerializer(serializers.ModelSerializer): 
+    first_name = serializers.CharField(source='user.first_name', read_only=True)
+    last_name = serializers.CharField(source='user.last_name', read_only=True)
+    email = serializers.EmailField(source='user.email', read_only=True)
+    
+    class Meta:
+        model = Parent
+        fields = [
+            'first_name',
+            'last_name',
+            'email',
+            'phone_number'
+        ]
+
+
+class BusPassRequestSerializer(serializers.ModelSerializer):
+    student_name = serializers.SerializerMethodField()
+    class Meta:
+        model = BusPassRequest
+        fields = [
+            'id',
+            'student',
+            'student_name',
+            'status',
+            'request_date',
+            'requested_valid_from',
+            'requested_valid_until',
+            'reason',
+            'admin_notes',
+            'approved_valid_from',
+            'approved_valid_until'
+        ]
+        read_only_fields = ['id', 'student', 'status', 'request_date', 'admin_notes', 'approved_valid_from', 'approved_valid_until']
+
+    def get_student_name(self, obj):
+        if obj.student.user:
+            return obj.student.user.get_full_name()
+        return obj.student.university_id
+    
+
+class AdminStudentDetailSerializer(serializers.ModelSerializer):
+   
+    first_name = serializers.CharField(source='user.first_name', read_only=True)
+    last_name = serializers.CharField(source='user.last_name', read_only=True)
+    email = serializers.EmailField(source='user.email', read_only=True)
+    
+    schedule_details = serializers.SerializerMethodField()
+    parents = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Student
+        fields = [
+            'id',
+            'university_id',
+            'first_name',
+            'last_name',
+            'email',
+            'registration_code',
+            'schedule_id',
+            'schedule_details',
+            'parents',
+            'created_at'
+        ]
+
+    def get_schedule_details(self, obj):
+        try:
+            return get_student_schedule_by_id(obj.schedule_id)
+        except Exception:
+            return None
+
+    def get_parents(self, obj):
+        parents = obj.parents.all()
+        return [
+            {
+                "id": p.id,
+                "name": f"{p.user.first_name} {p.user.last_name}" if p.user else "Unknown",
+                "phone": p.phone_number,
+                "email": p.user.email if p.user else "Unknown"
+            }
+            for p in parents
+        ]
+    
+class AdminParentDetailSerializer(serializers.ModelSerializer):
+    first_name = serializers.CharField(source='user.first_name', read_only=True)
+    last_name = serializers.CharField(source='user.last_name', read_only=True)
+    email = serializers.EmailField(source='user.email', read_only=True)
+    
+    children = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Parent
+        fields = [
+            'id',
+            'first_name',
+            'last_name',
+            'email',
+            'phone_number',
+            'children',
+            'created_at'
+        ]
+
+    def get_children(self, obj):
+        children = obj.children.all()
+        return [
+            {
+                "university_id": child.university_id,
+                "name": f"{child.user.first_name} {child.user.last_name}" if child.user else "Unknown",
+                "schedule_id": child.schedule_id
+            }
+            for child in children
+        ]
+    

@@ -69,10 +69,17 @@ class AttendanceLog(models.Model):
         INVALID = 'INVALID', 'Invalid Scan'
         OVERRIDE = 'OVERRIDE', 'Admin Pass Used'
 
+    class BusDirection(models.TextChoices):
+        INBOUND = 'INBOUND', 'Inbound to the University'
+        OUTBOUND = 'OUTBOUND', 'Outbound to dropoff'
+
     student = models.ForeignKey(
         Student, on_delete=models.CASCADE, related_name="attendance_logs", db_index=True
     )
     timestamp = models.DateTimeField(db_index=True)
+    direction = models.CharField(
+        max_length=10, choices=BusDirection.choices, default=BusDirection.INBOUND
+    )
     bus_number = models.CharField(
         max_length=50, blank=True, null=True
     )
@@ -109,4 +116,27 @@ class StudentBusPass(models.Model):
         ordering = ['-valid_from']
     
 
-#testchange
+class BusPassRequest(models.Model):
+    class RequestStatus(models.TextChoices):
+        PENDING = 'PENDING', 'Pending Review'
+        APPROVED = 'APPROVED', 'Approved'
+        REJECTED = 'REJECTED', 'Rejected'
+
+    student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name="pass_requests")
+    status = models.CharField(max_length=10, choices=RequestStatus.choices, default=RequestStatus.PENDING, db_index=True)
+
+    request_date = models.DateTimeField(auto_now_add=True)
+    requested_valid_from = models.DateTimeField()
+    requested_valid_until = models.DateTimeField()
+    reason = models.TextField()
+
+    approved_valid_from = models.DateTimeField(null=True, blank=True)
+    approved_valid_until = models.DateTimeField(null=True, blank=True)
+    
+    admin_notes = models.TextField(blank=True, null=True)
+
+    def __str__(self):
+        return f"Request from {self.student.university_id}: {self.status}"
+    
+    class Meta:
+        ordering = ['-request_date']
